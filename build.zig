@@ -233,6 +233,7 @@ const EngineSelection = struct {
     enable_memory_lancedb: bool = false,
     enable_postgres: bool = false,
     enable_memory_clickhouse: bool = false,
+    enable_memory_latticedb: bool = false,
 
     fn enableBase(self: *EngineSelection) void {
         self.enable_memory_none = true;
@@ -248,6 +249,7 @@ const EngineSelection = struct {
         self.enable_memory_lancedb = true;
         self.enable_postgres = true;
         self.enable_memory_clickhouse = true;
+        self.enable_memory_latticedb = true;
     }
 
     fn finalize(self: *EngineSelection) void {
@@ -265,7 +267,8 @@ const EngineSelection = struct {
             self.enable_memory_redis or
             self.enable_memory_lancedb or
             self.enable_postgres or
-            self.enable_memory_clickhouse;
+            self.enable_memory_clickhouse or
+            self.enable_memory_latticedb;
     }
 };
 
@@ -318,6 +321,8 @@ fn parseEnginesOption(raw: []const u8) !EngineSelection {
             selection.enable_postgres = true;
         } else if (std.mem.eql(u8, token, "clickhouse")) {
             selection.enable_memory_clickhouse = true;
+        } else if (std.mem.eql(u8, token, "latticedb")) {
+            selection.enable_memory_latticedb = true;
         } else {
             std.log.err("unknown engine '{s}' in -Dengines list", .{token});
             return error.InvalidEnginesOption;
@@ -396,7 +401,7 @@ pub fn build(b: *std.Build) void {
     const engines_raw = b.option(
         []const u8,
         "engines",
-        "Memory engines list. Tokens: base|minimal|all|none|markdown|memory|api|sqlite|lucid|redis|lancedb|postgres|clickhouse (default: base,sqlite)",
+        "Memory engines list. Tokens: base|minimal|all|none|markdown|memory|api|sqlite|lucid|redis|lancedb|postgres|clickhouse|latticedb (default: base,sqlite)",
     );
     const engines = if (engines_raw) |raw| blk: {
         const parsed = parseEnginesOption(raw) catch {
@@ -416,6 +421,7 @@ pub fn build(b: *std.Build) void {
     const enable_memory_lancedb = engines.enable_memory_lancedb;
     const enable_postgres = engines.enable_postgres;
     const enable_memory_clickhouse = engines.enable_memory_clickhouse;
+    const enable_memory_latticedb = engines.enable_memory_latticedb;
     const enable_channel_cli = channels.enable_channel_cli;
     const enable_channel_telegram = channels.enable_channel_telegram;
     const enable_channel_discord = channels.enable_channel_discord;
@@ -478,6 +484,7 @@ pub fn build(b: *std.Build) void {
     build_options.addOption(bool, "enable_memory_redis", enable_memory_redis);
     build_options.addOption(bool, "enable_memory_lancedb", effective_enable_memory_lancedb);
     build_options.addOption(bool, "enable_memory_clickhouse", enable_memory_clickhouse);
+    build_options.addOption(bool, "enable_memory_latticedb", enable_memory_latticedb);
     build_options.addOption(bool, "enable_channel_cli", enable_channel_cli);
     build_options.addOption(bool, "enable_channel_telegram", enable_channel_telegram);
     build_options.addOption(bool, "enable_channel_discord", enable_channel_discord);
@@ -527,6 +534,13 @@ pub fn build(b: *std.Build) void {
         }
         if (enable_embedded_wasm3) {
             addEmbeddedWasm3(module, b, target, optimize);
+        }
+        if (enable_memory_latticedb) {
+            const lattice_dep = b.dependency("latticedb", .{
+                .target = target,
+                .optimize = optimize,
+            });
+            module.addImport("lattice", lattice_dep.module("lattice"));
         }
         break :blk module;
     };
