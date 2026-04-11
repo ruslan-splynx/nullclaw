@@ -14,6 +14,7 @@ const redis_engine = @import("redis.zig");
 const lancedb_engine = @import("lancedb.zig");
 const api_engine = @import("api.zig");
 const clickhouse_engine = @import("clickhouse.zig");
+const latticedb_engine = if (build_options.enable_memory_latticedb) @import("latticedb.zig") else struct {};
 
 // ── Capability & descriptor types ────────────────────────────────
 
@@ -203,7 +204,17 @@ const clickhouse_backends = if (build_options.enable_memory_clickhouse) [_]Backe
     .create = &createClickHouse,
 }} else [0]BackendDescriptor{};
 
-pub const all = hybrid_backends ++ markdown_backends ++ api_backends ++ memory_backends ++ none_backends ++ sqlite_backends ++ lucid_backends ++ redis_backends ++ lancedb_backends ++ pg_backends ++ clickhouse_backends;
+const latticedb_backends = if (build_options.enable_memory_latticedb) [_]BackendDescriptor{.{
+    .name = "latticedb",
+    .label = "LatticeDB — embedded graph DB with vectors + BM25",
+    .auto_save_default = true,
+    .capabilities = .{ .supports_keyword_rank = true, .supports_session_store = false, .supports_transactions = true, .supports_outbox = false },
+    .needs_db_path = true,
+    .needs_workspace = false,
+    .create = &createLatticeDb,
+}} else [0]BackendDescriptor{};
+
+pub const all = hybrid_backends ++ markdown_backends ++ api_backends ++ memory_backends ++ none_backends ++ sqlite_backends ++ lucid_backends ++ redis_backends ++ lancedb_backends ++ pg_backends ++ clickhouse_backends ++ latticedb_backends;
 pub const known_backend_names = [_][]const u8{
     "hybrid",
     "none",
@@ -216,8 +227,9 @@ pub const known_backend_names = [_][]const u8{
     "lancedb",
     "postgres",
     "clickhouse",
+    "latticedb",
 };
-pub const known_backends_csv = "hybrid, none, markdown, memory, api, sqlite, lucid, redis, lancedb, postgres, clickhouse";
+pub const known_backends_csv = "hybrid, none, markdown, memory, api, sqlite, lucid, redis, lancedb, postgres, clickhouse, latticedb";
 
 // ── Lookup ───────────────────────────────────────────────────────
 
@@ -247,6 +259,7 @@ pub fn engineTokenForBackend(name: []const u8) ?[]const u8 {
     if (std.mem.eql(u8, name, "lancedb")) return "lancedb";
     if (std.mem.eql(u8, name, "postgres")) return "postgres";
     if (std.mem.eql(u8, name, "clickhouse")) return "clickhouse";
+    if (std.mem.eql(u8, name, "latticedb")) return "latticedb";
     return null;
 }
 
@@ -370,6 +383,16 @@ fn createLanceDb(allocator: std.mem.Allocator, cfg: BackendConfig) !BackendInsta
     return .{ .memory = impl_.memory(), .session_store = null };
 }
 
+fn createLatticeDb(allocator: std.mem.Allocator, cfg: BackendConfig) !BackendInstance {
+    if (!build_options.enable_memory_latticedb) return error.LatticeDbNotEnabled;
+    const db_path = cfg.db_path orelse return error.MissingDbPath;
+    const impl_ = try allocator.create(latticedb_engine.LatticeMemory);
+    errdefer allocator.destroy(impl_);
+    impl_.* = try latticedb_engine.LatticeMemory.init(allocator, std.mem.span(db_path));
+    impl_.owns_self = true;
+    return .{ .memory = impl_.memory(), .session_store = null };
+}
+
 fn createApi(allocator: std.mem.Allocator, cfg: BackendConfig) !BackendInstance {
     const api_cfg = cfg.api_config orelse return error.MissingApiConfig;
     const impl_ = try allocator.create(api_engine.ApiMemory);
@@ -460,7 +483,8 @@ test "registry length" {
         @as(usize, @intFromBool(build_options.enable_memory_redis)) +
         @as(usize, @intFromBool(build_options.enable_memory_lancedb)) +
         @as(usize, @intFromBool(build_options.enable_postgres)) +
-        @as(usize, @intFromBool(build_options.enable_memory_clickhouse));
+        @as(usize, @intFromBool(build_options.enable_memory_clickhouse)) +
+        @as(usize, @intFromBool(build_options.enable_memory_latticedb));
     try std.testing.expectEqual(expected, all.len);
 }
 
