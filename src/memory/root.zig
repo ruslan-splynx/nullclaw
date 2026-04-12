@@ -3,7 +3,7 @@
 //! Mirrors ZeroClaw's memory architecture:
 //!   - Memory vtable interface (store, recall, get, list, forget, count)
 //!   - MemoryEntry, MemoryCategory
-//!   - Multiple backends: SQLite (FTS5), Markdown (file-based), None (no-op)
+//!   - Multiple backends: SQLite (FTS5), Markdown (file-based), LatticeDB (graph), None (no-op)
 //!   - ResponseCache for LLM response deduplication
 //!   - Document chunking for large markdown files
 
@@ -29,6 +29,9 @@ pub const lancedb = if (build_options.enable_memory_lancedb) @import("engines/la
 };
 pub const api = @import("engines/api.zig");
 pub const clickhouse = @import("engines/clickhouse.zig");
+pub const latticedb = if (build_options.enable_memory_latticedb) @import("engines/latticedb.zig") else struct {
+    pub const LatticeMemory = struct {};
+};
 pub const registry = @import("engines/registry.zig");
 
 // retrieval/ (Layer B: Retrieval Engine)
@@ -75,6 +78,7 @@ pub const PostgresMemory = if (build_options.enable_postgres) postgres.PostgresM
 pub const RedisMemory = redis.RedisMemory;
 pub const ClickHouseMemory = clickhouse.ClickHouseMemory;
 pub const LanceDbMemory = lancedb.LanceDbMemory;
+pub const LatticeMemory = latticedb.LatticeMemory;
 pub const ApiMemory = api.ApiMemory;
 pub const ResponseCache = cache.ResponseCache;
 pub const Chunk = chunker.Chunk;
@@ -2270,6 +2274,7 @@ test {
     _ = redis;
     _ = lancedb;
     _ = clickhouse;
+    _ = latticedb;
     _ = registry;
     _ = @import("engines/contract_test.zig");
 
