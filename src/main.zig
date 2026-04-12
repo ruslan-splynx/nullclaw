@@ -2205,7 +2205,7 @@ fn printOnboardUsage() void {
         \\  --api-key KEY     provider API key to persist in config
         \\  --provider PROV   default provider key (e.g. openrouter, anthropic, custom:https://...)
         \\  --model MODEL     default model for the provider (e.g. gpt-5.2, claude-opus-4-6)
-        \\  --memory MEM      memory backend key (e.g. markdown, sqlite, memory)
+        \\  --memory MEM      memory backend key (e.g. markdown, sqlite, memory, latticedb)
         \\
         \\Examples:
         \\  nullclaw onboard --api-key sk-... --provider openrouter

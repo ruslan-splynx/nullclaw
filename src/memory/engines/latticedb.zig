@@ -1,12 +1,26 @@
 //! LatticeDB memory backend.
 //!
 //! Stores agent memory as a property graph:
-//!   - Entry nodes   (label "Entry")    — properties: key, content, created_at
-//!   - Category nodes (label "Category") — property: name
-//!   - Session nodes  (label "Session")  — property: id
+//!   - Entry nodes         (label "Entry")        — props: key, created_at
+//!   - ContentChunk nodes  (label "ContentChunk") — props: seq, data
+//!   - Category nodes      (label "Category")     — props: name
+//!   - Session nodes       (label "Session")      — props: id
+//!   - HAS_CHUNK edges from each Entry to its ContentChunks
 //!   - BELONGS_TO_CATEGORY edges from each Entry to its Category
 //!   - IN_SESSION edges from each Entry to its Session (when session_id is set)
-//!   - FTS index on Entry.content for recall() via BM25
+//!   - FTS index on Entry (via the full reconstructed content) for recall() via BM25
+//!
+//! Why content lives in child nodes: LatticeDB 0.5.0 has two hardcoded
+//! fixed-size stack buffers that bound what a single node can hold:
+//!   - database.zig:1514 — a 512-byte buffer caps each STRING/BYTES property
+//!     value at ~507 bytes on write.
+//!   - node.zig:199 — a 4096-byte buffer caps the *entire* serialized node
+//!     (labels + every property + framing).
+//! Storing multi-KB workspace templates (SOUL.md, AGENTS.md, …) inline on
+//! the Entry node therefore breaks onboard scaffold. Splitting content into
+//! ContentChunk child nodes of ≤ CONTENT_CHUNK_SIZE bytes each keeps every
+//! individual node well under both limits while still letting a single
+//! Entry hold arbitrarily large content.
 //!
 //! v1 limitation: the in-memory key→node cache is not rebuilt from disk on
 //! reopen. Fresh-DB workflows (contract tests, first-run agents) are unaffected;
@@ -43,15 +57,32 @@ fn mapCErr(code: c.lattice_error) Error!void {
 }
 
 const ENTRY_LABEL: [:0]const u8 = "Entry";
+const CONTENT_CHUNK_LABEL: [:0]const u8 = "ContentChunk";
 const CATEGORY_LABEL: [:0]const u8 = "Category";
 const SESSION_LABEL: [:0]const u8 = "Session";
+const HAS_CHUNK: [:0]const u8 = "HAS_CHUNK";
 const BELONGS_TO_CATEGORY: [:0]const u8 = "BELONGS_TO_CATEGORY";
 const IN_SESSION: [:0]const u8 = "IN_SESSION";
 const PROP_KEY: [:0]const u8 = "key";
-const PROP_CONTENT: [:0]const u8 = "content";
 const PROP_CREATED_AT: [:0]const u8 = "created_at";
 const PROP_NAME: [:0]const u8 = "name";
 const PROP_ID: [:0]const u8 = "id";
+const PROP_SEQ: [:0]const u8 = "seq";
+const PROP_DATA: [:0]const u8 = "data";
+
+/// Max payload bytes per ContentChunk.data string property. Kept well
+/// below the observed ~507-byte per-STRING-property cap in LatticeDB
+/// 0.5.0, and well below the ~4000-byte per-node-serialization cap
+/// (each chunk node carries only `seq` + `data`, so total node size is
+/// CONTENT_CHUNK_SIZE + ~30 bytes of framing).
+const CONTENT_CHUNK_SIZE: usize = 400;
+
+/// Maximum bytes we hand to `lattice_fts_index`. LatticeDB 0.5.0 panics
+/// with an integer overflow inside its tokenizer/posting code somewhere
+/// between 1700 and 9000 bytes, so we cap FTS indexing at 2 KiB —
+/// enough to capture a meaningful lead paragraph for recall. Entries
+/// store the full content via chunk nodes regardless of this cap.
+const FTS_INDEX_MAX_BYTES: usize = 2048;
 
 pub const LatticeMemory = struct {
     allocator: Allocator,
@@ -71,7 +102,12 @@ pub const LatticeMemory = struct {
             .create = true,
             .read_only = false,
             .cache_size_mb = 16,
-            .page_size = 4096,
+            // Default 4 KiB pages cap a single STRING property at ~256 bytes
+            // before the storage engine returns err_io. Onboard bootstrap
+            // templates (SOUL.md, AGENTS.md …) run up to ~10 KiB, so bump
+            // pages to 64 KiB which lifts the per-property ceiling above
+            // anything the scaffold writes.
+            .page_size = 65536,
             .enable_vector = false,
             .vector_dimensions = 0,
         };
@@ -170,6 +206,135 @@ pub const LatticeMemory = struct {
     ) !void {
         var val = stringValue(value.ptr, value.len);
         try mapCErr(c.lattice_node_set_property(txn, node_id, key_z.ptr, &val));
+    }
+
+    /// Split `content` into CONTENT_CHUNK_SIZE-sized `ContentChunk` nodes
+    /// and attach them to `entry_node_id` via HAS_CHUNK edges. Each chunk
+    /// carries a `seq` int (0-based) and a `data` string so that readers
+    /// can reassemble the content in order regardless of edge iteration
+    /// order. Empty content creates zero chunk nodes.
+    fn writeContentChunks(
+        txn: *c.lattice_txn,
+        entry_node_id: NodeId,
+        content: []const u8,
+    ) !void {
+        if (content.len == 0) return;
+
+        var offset: usize = 0;
+        var seq: i64 = 0;
+        while (offset < content.len) : (seq += 1) {
+            const end = @min(offset + CONTENT_CHUNK_SIZE, content.len);
+            const slice = content[offset..end];
+
+            var chunk_id: NodeId = 0;
+            try mapCErr(c.lattice_node_create(txn, CONTENT_CHUNK_LABEL.ptr, &chunk_id));
+            try setNodePropertyInt(txn, chunk_id, PROP_SEQ, seq);
+            try setNodePropertyString(txn, chunk_id, PROP_DATA, slice);
+
+            var edge_id: EdgeId = 0;
+            try mapCErr(c.lattice_edge_create(txn, entry_node_id, chunk_id, HAS_CHUNK.ptr, &edge_id));
+
+            offset = end;
+        }
+    }
+
+    /// Walk the outgoing HAS_CHUNK edges of `entry_node_id`, read each
+    /// chunk's (seq, data), sort by seq, and return a freshly-allocated
+    /// contiguous slice. An Entry with zero HAS_CHUNK edges is treated as
+    /// holding empty content (returns a zero-length owned slice), so
+    /// loadEntry can distinguish "missing Entry" from "empty Entry" via
+    /// the presence of the Entry's own key/created_at properties.
+    fn readContentChunks(
+        allocator: Allocator,
+        txn: *c.lattice_txn,
+        entry_node_id: NodeId,
+    ) ![]u8 {
+        var edges: ?*c.lattice_edge_result = null;
+        try mapCErr(c.lattice_edge_get_outgoing(txn, entry_node_id, &edges));
+        if (edges == null) return try allocator.alloc(u8, 0);
+        defer c.lattice_edge_result_free(edges);
+
+        const edge_count = c.lattice_edge_result_count(edges);
+
+        const ChunkPiece = struct {
+            seq: i64,
+            data: []u8,
+        };
+
+        var pieces: std.ArrayListUnmanaged(ChunkPiece) = .empty;
+        defer {
+            for (pieces.items) |p| allocator.free(p.data);
+            pieces.deinit(allocator);
+        }
+
+        var i: u32 = 0;
+        while (i < edge_count) : (i += 1) {
+            var source: NodeId = 0;
+            var target: NodeId = 0;
+            var type_ptr: [*c]const u8 = undefined;
+            var type_len: c_uint = 0;
+            try mapCErr(c.lattice_edge_result_get(edges, i, &source, &target, &type_ptr, &type_len));
+
+            const etype = type_ptr[0..@as(usize, type_len)];
+            if (!std.mem.eql(u8, etype, HAS_CHUNK)) continue;
+
+            const seq = (try readIntProperty(txn, target, PROP_SEQ)) orelse continue;
+            const data = (try readStringProperty(allocator, txn, target, PROP_DATA)) orelse continue;
+            errdefer allocator.free(data);
+
+            try pieces.append(allocator, .{ .seq = seq, .data = data });
+        }
+
+        std.mem.sort(ChunkPiece, pieces.items, {}, struct {
+            fn lt(_: void, a: ChunkPiece, b: ChunkPiece) bool {
+                return a.seq < b.seq;
+            }
+        }.lt);
+
+        var total: usize = 0;
+        for (pieces.items) |p| total += p.data.len;
+
+        const out = try allocator.alloc(u8, total);
+        var cursor: usize = 0;
+        for (pieces.items) |p| {
+            @memcpy(out[cursor .. cursor + p.data.len], p.data);
+            cursor += p.data.len;
+        }
+        return out;
+    }
+
+    /// Walk outgoing HAS_CHUNK edges and return the list of target node
+    /// IDs so `implForget` can cascade-delete them before dropping the
+    /// parent Entry. Caller owns the returned slice.
+    fn collectChunkNodeIds(
+        allocator: Allocator,
+        txn: *c.lattice_txn,
+        entry_node_id: NodeId,
+    ) ![]NodeId {
+        var edges: ?*c.lattice_edge_result = null;
+        try mapCErr(c.lattice_edge_get_outgoing(txn, entry_node_id, &edges));
+        if (edges == null) return try allocator.alloc(NodeId, 0);
+        defer c.lattice_edge_result_free(edges);
+
+        var out: std.ArrayListUnmanaged(NodeId) = .empty;
+        errdefer out.deinit(allocator);
+
+        const count = c.lattice_edge_result_count(edges);
+        var i: u32 = 0;
+        while (i < count) : (i += 1) {
+            var source: NodeId = 0;
+            var target: NodeId = 0;
+            var type_ptr: [*c]const u8 = undefined;
+            var type_len: c_uint = 0;
+            try mapCErr(c.lattice_edge_result_get(edges, i, &source, &target, &type_ptr, &type_len));
+
+            const etype = type_ptr[0..@as(usize, type_len)];
+            if (std.mem.eql(u8, etype, HAS_CHUNK)) {
+                try out.append(allocator, target);
+            }
+        }
+
+        return try out.toOwnedSlice(allocator);
     }
 
     fn setNodePropertyInt(
@@ -321,7 +486,7 @@ pub const LatticeMemory = struct {
         const key = (try readStringProperty(allocator, txn, entry_node_id, PROP_KEY)) orelse return null;
         errdefer allocator.free(key);
 
-        const content = (try readStringProperty(allocator, txn, entry_node_id, PROP_CONTENT)) orelse return null;
+        const content = try readContentChunks(allocator, txn, entry_node_id);
         errdefer allocator.free(content);
 
         const created_at_ms = (try readIntProperty(txn, entry_node_id, PROP_CREATED_AT)) orelse 0;
@@ -402,8 +567,8 @@ pub const LatticeMemory = struct {
         try mapCErr(c.lattice_node_create(txn, ENTRY_LABEL.ptr, &entry_id));
 
         try setNodePropertyString(txn, entry_id, PROP_KEY, key);
-        try setNodePropertyString(txn, entry_id, PROP_CONTENT, content);
         try setNodePropertyInt(txn, entry_id, PROP_CREATED_AT, std.time.milliTimestamp());
+        try writeContentChunks(txn, entry_id, content);
 
         const cat_node = try self.getOrCreateCategoryNode(txn, category.toString());
         var cat_edge: EdgeId = 0;
@@ -416,7 +581,8 @@ pub const LatticeMemory = struct {
         }
 
         if (content.len > 0) {
-            try mapCErr(c.lattice_fts_index(txn, entry_id, content.ptr, content.len));
+            const fts_len = @min(content.len, FTS_INDEX_MAX_BYTES);
+            try mapCErr(c.lattice_fts_index(txn, entry_id, content.ptr, fts_len));
         }
 
         try commit(txn);
@@ -545,6 +711,11 @@ pub const LatticeMemory = struct {
         var committed = false;
         errdefer if (!committed) rollback(txn);
 
+        // Collect HAS_CHUNK targets up-front — once we start deleting edges
+        // the outgoing-edge iterator is unsafe to reuse.
+        const chunk_ids = try collectChunkNodeIds(self.allocator, txn, node_id);
+        defer self.allocator.free(chunk_ids);
+
         // Explicitly remove outgoing edges so the node delete never references
         // stale adjacency, regardless of whether lattice cascades.
         var edges: ?*c.lattice_edge_result = null;
@@ -565,6 +736,13 @@ pub const LatticeMemory = struct {
                 defer self.allocator.free(etype_z);
                 _ = c.lattice_edge_delete(txn, source, target, etype_z.ptr);
             }
+        }
+
+        // Drop the orphaned ContentChunk nodes that the Entry used to own.
+        // Best-effort: if a chunk node is already gone (race with another
+        // writer on reopen), lattice returns not_found which we ignore.
+        for (chunk_ids) |cid| {
+            _ = c.lattice_node_delete(txn, cid);
         }
 
         try mapCErr(c.lattice_node_delete(txn, node_id));
@@ -652,4 +830,70 @@ test "latticedb memory smoke" {
     const forgotten = try m.forget("k1");
     try std.testing.expect(forgotten);
     try std.testing.expectEqual(@as(usize, 0), try m.count());
+}
+
+test "latticedb memory round-trips multi-KB content via chunk nodes" {
+    // Regression guard against the LatticeDB 0.5.0 size caps:
+    //   - ~507-byte per-STRING-property limit (database.zig:1514 buf[512])
+    //   - 4096-byte per-node serialization limit (node.zig:199 buf[4096])
+    //   - integer-overflow panic in lattice_fts_index above ~2 KiB
+    // writeContentChunks splits content across child ContentChunk nodes
+    // and FTS is capped at FTS_INDEX_MAX_BYTES, so store+get must survive
+    // well past all three thresholds. Covers the workspace-template flow
+    // that `nullclaw onboard --memory latticedb` exercises.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const paths = try openTmp(&tmp);
+    defer std.testing.allocator.free(paths.path);
+    defer std.testing.allocator.free(paths.base);
+
+    var mem = try LatticeMemory.init(std.testing.allocator, paths.path);
+    defer mem.deinit();
+    const m = mem.memory();
+
+    const sizes = [_]usize{ 64, 256, 512, 1024, 1700, 4000, 9242, 16384 };
+    for (sizes) |sz| {
+        const buf = try std.testing.allocator.alloc(u8, sz);
+        defer std.testing.allocator.free(buf);
+        // Distinct byte pattern per offset so we can verify ordering of
+        // reassembled chunks, not just length.
+        for (buf, 0..) |*b, i| b.* = @truncate(i);
+        const key_buf = try std.fmt.allocPrint(std.testing.allocator, "k{d}", .{sz});
+        defer std.testing.allocator.free(key_buf);
+
+        try m.store(key_buf, buf, .core, null);
+
+        const got = try m.get(std.testing.allocator, key_buf);
+        try std.testing.expect(got != null);
+        defer got.?.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(usize, sz), got.?.content.len);
+        try std.testing.expectEqualSlices(u8, buf, got.?.content);
+    }
+
+    try std.testing.expectEqual(@as(usize, sizes.len), try m.count());
+}
+
+test "latticedb memory stores many entries with shared category" {
+    // Reproduces the onboard scaffoldWorkspace flow: 7+ store calls sharing
+    // category .core and no session_id. Earlier manual testing showed
+    // `nullclaw onboard --memory latticedb` failing with LatticeOpFailed
+    // once scaffold tried to write a run of bootstrap files.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const paths = try openTmp(&tmp);
+    defer std.testing.allocator.free(paths.path);
+    defer std.testing.allocator.free(paths.base);
+
+    var mem = try LatticeMemory.init(std.testing.allocator, paths.path);
+    defer mem.deinit();
+    const m = mem.memory();
+
+    const files = [_][]const u8{
+        "SOUL.md",     "AGENTS.md", "TOOLS.md",     "CONFIG.md",
+        "IDENTITY.md", "USER.md",   "HEARTBEAT.md", "BOOTSTRAP.md",
+    };
+    for (files) |f| {
+        try m.store(f, "test content for bootstrap scaffold", .core, null);
+    }
+    try std.testing.expectEqual(@as(usize, files.len), try m.count());
 }
