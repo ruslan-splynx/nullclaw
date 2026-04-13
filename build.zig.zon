@@ -16,8 +16,8 @@
             .hash = "wasm3-0.5.1-hrMdNS09BQAWSU0TI6mVS8KfW4hxexjFvyOQINgphwKu",
         },
         .latticedb = .{
-            .url = "git+https://github.com/ruslan-splynx/latticedb#b7eeb87e26e929e40ee99e608305a3ef321859cd",
-            .hash = "lattice-0.1.0-HogrVq-MGgAR-weuR22OcCuQGmjE2aVZmUiAcbSmacv6",
+            .url = "git+https://github.com/ruslan-splynx/latticedb#81511b8fd0d0d54ddbf40520824282eea8d47ee9",
+            .hash = "lattice-0.1.0-HogrVtieGgAiaHkTVDtEYp0oMx4r1wgVusUHcnmeEjui",
         },
     },
     .paths = .{

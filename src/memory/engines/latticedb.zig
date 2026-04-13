@@ -115,10 +115,72 @@ pub const LatticeMemory = struct {
             return Error.LatticeOpenFailed;
         }
 
-        return Self{
+        var self = Self{
             .allocator = allocator,
             .db = db_ptr.?,
         };
+        errdefer {
+            freeOwnedKeys(self.allocator, &self.key_to_node);
+            freeOwnedKeys(self.allocator, &self.category_to_node);
+            freeOwnedKeys(self.allocator, &self.session_to_node);
+            _ = c.lattice_close(self.db);
+        }
+
+        // Rebuild the in-memory key→node / category→node / session→node
+        // caches from whatever is already on disk. Without this, a
+        // second process opening the same DB (e.g. a fresh `nullclaw
+        // memory stats` or a restarted `agent`) would start with empty
+        // caches and re-create nodes for keys that already exist,
+        // drifting the store and eventually tripping err_io in the
+        // lattice layer. Requires `lattice_get_nodes_by_label` (added
+        // on lattice feat/expose-zig-module 81511b8).
+        try self.rebuildCaches();
+
+        return self;
+    }
+
+    fn rebuildCaches(self: *Self) !void {
+        try self.rebuildLabelCache(ENTRY_LABEL, PROP_KEY, &self.key_to_node);
+        try self.rebuildLabelCache(CATEGORY_LABEL, PROP_NAME, &self.category_to_node);
+        try self.rebuildLabelCache(SESSION_LABEL, PROP_ID, &self.session_to_node);
+    }
+
+    /// Load every node carrying `label`, read the string property
+    /// `key_prop`, and register `property_value → node_id` in `out`.
+    /// Nodes missing the property (corrupt / partially written) are
+    /// skipped. Called once per cache on `init`.
+    fn rebuildLabelCache(
+        self: *Self,
+        label: [:0]const u8,
+        key_prop: [:0]const u8,
+        out: *std.StringHashMapUnmanaged(NodeId),
+    ) !void {
+        var ids_ptr: ?[*]NodeId = null;
+        var count: usize = 0;
+        const err = c.lattice_get_nodes_by_label(self.db, label.ptr, label.len, &ids_ptr, &count);
+        try mapCErr(err);
+        if (count == 0 or ids_ptr == null) return;
+        defer c.lattice_free_node_ids(ids_ptr, count);
+        const ids = ids_ptr.?[0..count];
+
+        const txn = try self.beginRead();
+        defer rollback(txn);
+
+        for (ids) |node_id| {
+            const key_bytes = (try readStringProperty(self.allocator, txn, node_id, key_prop)) orelse continue;
+            // Ownership of `key_bytes` transfers to the cache on success;
+            // on a duplicate key (should not happen in a healthy store),
+            // the earlier entry wins and we free the second copy.
+            const gop = out.getOrPut(self.allocator, key_bytes) catch {
+                self.allocator.free(key_bytes);
+                return Error.OutOfMemory;
+            };
+            if (gop.found_existing) {
+                self.allocator.free(key_bytes);
+            } else {
+                gop.value_ptr.* = node_id;
+            }
+        }
     }
 
     pub fn deinit(self: *Self) void {
@@ -830,6 +892,79 @@ test "latticedb memory smoke" {
     const forgotten = try m.forget("k1");
     try std.testing.expect(forgotten);
     try std.testing.expectEqual(@as(usize, 0), try m.count());
+}
+
+test "latticedb memory rebuilds key/category/session caches on reopen" {
+    // Regression: before the `lattice_get_nodes_by_label`-backed init
+    // rebuild, a process that opened an existing LatticeDB would start
+    // with empty `key_to_node` / `category_to_node` / `session_to_node`
+    // maps and happily create duplicate Entry nodes for keys that were
+    // already on disk, eventually tripping err_io on large scaffolds.
+    // This test stores content under the first LatticeMemory instance,
+    // drops it, reopens the same file, and asserts (a) count matches,
+    // (b) `get` hits every original key, (c) categories/sessions are
+    // reused by id instead of re-created, (d) overwrite via `store`
+    // updates the existing node (chunk replacement).
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const paths = try openTmp(&tmp);
+    defer std.testing.allocator.free(paths.path);
+    defer std.testing.allocator.free(paths.base);
+
+    var initial_entry_id: NodeId = 0;
+    {
+        var mem = try LatticeMemory.init(std.testing.allocator, paths.path);
+        defer mem.deinit();
+        const m = mem.memory();
+
+        try m.store("alpha", "first entry content", .core, "sess-1");
+        try m.store("beta", "second entry content", .core, "sess-1");
+        try m.store("gamma", "third entry content", .daily, "sess-2");
+
+        try std.testing.expectEqual(@as(usize, 3), try m.count());
+        initial_entry_id = mem.key_to_node.get("alpha").?;
+    }
+
+    // Reopen — init() now scans existing Entry/Category/Session labels
+    // via `lattice_get_nodes_by_label` and repopulates every cache.
+    var mem = try LatticeMemory.init(std.testing.allocator, paths.path);
+    defer mem.deinit();
+    const m = mem.memory();
+
+    try std.testing.expectEqual(@as(usize, 3), try m.count());
+
+    const reloaded_entry_id = mem.key_to_node.get("alpha").?;
+    try std.testing.expectEqual(initial_entry_id, reloaded_entry_id);
+
+    {
+        const got = try m.get(std.testing.allocator, "alpha");
+        try std.testing.expect(got != null);
+        defer got.?.deinit(std.testing.allocator);
+        try std.testing.expectEqualStrings("first entry content", got.?.content);
+        try std.testing.expect(got.?.category.eql(.core));
+        try std.testing.expect(got.?.session_id != null);
+        try std.testing.expectEqualStrings("sess-1", got.?.session_id.?);
+    }
+
+    // Categories/sessions seen on disk must be reused, not re-created.
+    try std.testing.expect(mem.category_to_node.contains("core"));
+    try std.testing.expect(mem.category_to_node.contains("daily"));
+    try std.testing.expect(mem.session_to_node.contains("sess-1"));
+    try std.testing.expect(mem.session_to_node.contains("sess-2"));
+
+    // Overwrite path: `store` on an existing key must find the cached
+    // node, delete it (cascading its chunks), and re-insert. Without
+    // the rebuild, the cache lookup would miss and we'd end up with
+    // two Entry nodes with the same `key` string.
+    try m.store("alpha", "overwritten content", .core, "sess-1");
+    try std.testing.expectEqual(@as(usize, 3), try m.count());
+
+    {
+        const got = try m.get(std.testing.allocator, "alpha");
+        try std.testing.expect(got != null);
+        defer got.?.deinit(std.testing.allocator);
+        try std.testing.expectEqualStrings("overwritten content", got.?.content);
+    }
 }
 
 test "latticedb memory round-trips multi-KB content via chunk nodes" {
