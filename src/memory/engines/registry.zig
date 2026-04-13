@@ -16,6 +16,8 @@ const api_engine = @import("api.zig");
 const clickhouse_engine = @import("clickhouse.zig");
 const latticedb_engine = if (build_options.enable_memory_latticedb) @import("latticedb.zig") else struct {};
 
+const log = std.log.scoped(.memory_registry);
+
 // ── Capability & descriptor types ────────────────────────────────
 
 pub const BackendCapabilities = struct {
@@ -206,7 +208,7 @@ const clickhouse_backends = if (build_options.enable_memory_clickhouse) [_]Backe
 
 const latticedb_backends = if (build_options.enable_memory_latticedb) [_]BackendDescriptor{.{
     .name = "latticedb",
-    .label = "LatticeDB — embedded graph DB with vectors + BM25",
+    .label = "LatticeDB (experimental) — embedded graph DB; slower than sqlite for K/V, reserved for future graph/vector use cases",
     .auto_save_default = true,
     .capabilities = .{ .supports_keyword_rank = true, .supports_session_store = true, .supports_transactions = true, .supports_outbox = false },
     .needs_db_path = true,
@@ -385,6 +387,18 @@ fn createLanceDb(allocator: std.mem.Allocator, cfg: BackendConfig) !BackendInsta
 
 fn createLatticeDb(allocator: std.mem.Allocator, cfg: BackendConfig) !BackendInstance {
     if (!build_options.enable_memory_latticedb) return error.LatticeDbNotEnabled;
+    // Experimental status: the latticedb engine is slower than sqlite
+    // on every current nullclaw memory workload (K/V store, BM25
+    // recall, category/session filters) by 2–37× and reopen by up to
+    // 4000× (upstream `lattice_open` rebuilds its own indices on
+    // open, plus btree split-path blocks `CONTENT_CHUNK_SIZE` above
+    // ~500 bytes — see `src/memory/engines/latticedb.zig`). It is
+    // retained as a foundation for future graph / vector / hybrid
+    // retrieval features that lattice's shape would actually favor.
+    // The warning fires once per backend instantiation so operators
+    // who pick this engine today know what they are opting into
+    // without having to read the benchmark notes.
+    log.warn("latticedb backend is experimental: slower than sqlite for the current K/V workload (see `zig build bench`); reserved for future graph/vector use cases. Prefer `backend = \"sqlite\"` unless you need lattice specifically.", .{});
     const db_path = cfg.db_path orelse return error.MissingDbPath;
     const impl_ = try allocator.create(latticedb_engine.LatticeMemory);
     errdefer allocator.destroy(impl_);
