@@ -10,17 +10,20 @@
 //!   - IN_SESSION edges from each Entry to its Session (when session_id is set)
 //!   - FTS index on Entry (via the full reconstructed content) for recall() via BM25
 //!
-//! Why content lives in child nodes: LatticeDB 0.5.0 has two hardcoded
-//! fixed-size stack buffers that bound what a single node can hold:
-//!   - database.zig:1514 — a 512-byte buffer caps each STRING/BYTES property
-//!     value at ~507 bytes on write.
-//!   - node.zig:199 — a 4096-byte buffer caps the *entire* serialized node
-//!     (labels + every property + framing).
-//! Storing multi-KB workspace templates (SOUL.md, AGENTS.md, …) inline on
-//! the Entry node therefore breaks onboard scaffold. Splitting content into
-//! ContentChunk child nodes of ≤ CONTENT_CHUNK_SIZE bytes each keeps every
-//! individual node well under both limits while still letting a single
-//! Entry hold arbitrarily large content.
+//! Why content lives in child nodes: the btree layer underneath
+//! LatticeDB stores values inline in a single leaf page, so no single
+//! property value can exceed `lattice_open_options.page_size`. Splitting
+//! content across ContentChunk child nodes (each ≤ CONTENT_CHUNK_SIZE
+//! bytes of `data`) keeps every individual node well under the page
+//! size while still letting a single Entry hold arbitrary-length
+//! content. Upstream lattice `feat/expose-zig-module` (commits
+//! `da98e02`, `b7eeb87`) previously had two additional hardcoded stack
+//! buffers (`[512]u8` for WAL value payloads in database.zig and
+//! `[4096]u8` for whole-node serialization in graph/node.zig) and a
+//! panic inside `lattice_fts_index` on multi-KB docs; those are fixed
+//! at source, so this adapter no longer caps FTS indexing at 2 KiB and
+//! no longer needs to avoid inline STRING properties smaller than the
+//! page size.
 //!
 //! v1 limitation: the in-memory key→node cache is not rebuilt from disk on
 //! reopen. Fresh-DB workflows (contract tests, first-run agents) are unaffected;
@@ -76,13 +79,6 @@ const PROP_DATA: [:0]const u8 = "data";
 /// (each chunk node carries only `seq` + `data`, so total node size is
 /// CONTENT_CHUNK_SIZE + ~30 bytes of framing).
 const CONTENT_CHUNK_SIZE: usize = 400;
-
-/// Maximum bytes we hand to `lattice_fts_index`. LatticeDB 0.5.0 panics
-/// with an integer overflow inside its tokenizer/posting code somewhere
-/// between 1700 and 9000 bytes, so we cap FTS indexing at 2 KiB —
-/// enough to capture a meaningful lead paragraph for recall. Entries
-/// store the full content via chunk nodes regardless of this cap.
-const FTS_INDEX_MAX_BYTES: usize = 2048;
 
 pub const LatticeMemory = struct {
     allocator: Allocator,
@@ -581,8 +577,12 @@ pub const LatticeMemory = struct {
         }
 
         if (content.len > 0) {
-            const fts_len = @min(content.len, FTS_INDEX_MAX_BYTES);
-            try mapCErr(c.lattice_fts_index(txn, entry_id, content.ptr, fts_len));
+            // lattice 0.5.1+ (feat/expose-zig-module: da98e02, b7eeb87)
+            // tokenizes the full content and gracefully degrades the
+            // per-doc reverse-index when it would exceed a single btree
+            // leaf page, so we can hand over the entire content without
+            // the 2 KiB cap the earlier nullclaw workaround imposed.
+            try mapCErr(c.lattice_fts_index(txn, entry_id, content.ptr, content.len));
         }
 
         try commit(txn);
@@ -833,14 +833,16 @@ test "latticedb memory smoke" {
 }
 
 test "latticedb memory round-trips multi-KB content via chunk nodes" {
-    // Regression guard against the LatticeDB 0.5.0 size caps:
-    //   - ~507-byte per-STRING-property limit (database.zig:1514 buf[512])
-    //   - 4096-byte per-node serialization limit (node.zig:199 buf[4096])
+    // Regression guard for the LatticeDB 0.5.0 size caps that are now
+    // fixed upstream on feat/expose-zig-module (da98e02, b7eeb87):
+    //   - ~507-byte per-STRING-property cap (former database.zig:1514 buf[512])
+    //   - 4096-byte per-node serialization cap (former node.zig:199 buf[4096])
     //   - integer-overflow panic in lattice_fts_index above ~2 KiB
     // writeContentChunks splits content across child ContentChunk nodes
-    // and FTS is capped at FTS_INDEX_MAX_BYTES, so store+get must survive
-    // well past all three thresholds. Covers the workspace-template flow
-    // that `nullclaw onboard --memory latticedb` exercises.
+    // so each individual chunk stays under the btree leaf page size,
+    // which lets the engine store arbitrary-length content regardless of
+    // `lattice_open_options.page_size`. Covers the workspace-template
+    // flow that `nullclaw onboard --memory latticedb` exercises.
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const paths = try openTmp(&tmp);
