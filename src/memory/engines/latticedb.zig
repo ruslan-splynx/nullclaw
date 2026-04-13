@@ -863,6 +863,8 @@ pub const LatticeMemory = struct {
 
     const MESSAGE_KEY_PREFIX: []const u8 = "msg:";
     const AUTOSAVE_KEY_PREFIX: []const u8 = "autosave_";
+    const AUTOSAVE_USER_PREFIX: []const u8 = "autosave_user_";
+    const AUTOSAVE_ASSISTANT_PREFIX: []const u8 = "autosave_assistant_";
 
     fn messageKeyAlloc(
         allocator: Allocator,
@@ -873,12 +875,23 @@ pub const LatticeMemory = struct {
         return std.fmt.allocPrint(allocator, "msg:{s}:{d}:{s}", .{ session_id, nanos, role });
     }
 
+    /// Decode the role stored in either of the two chat-message key
+    /// schemes used by nullclaw:
+    ///   * `msg:<session>:<nanos>:<role>` — written by
+    ///     `LatticeMemory.saveMessage` via the SessionStore vtable.
+    ///   * `autosave_user_<nanos>` / `autosave_assistant_<nanos>` —
+    ///     written directly by `Agent.turn` through `mem.store`,
+    ///     which predates the SessionStore hookup. SessionStore users
+    ///     still need to see these turns on reopen, so we treat them
+    ///     as first-class message keys.
     fn roleFromMessageKey(key: []const u8) ?[]const u8 {
-        if (!std.mem.startsWith(u8, key, MESSAGE_KEY_PREFIX)) return null;
-        // Last `:` separates <nanos> from <role>. Find it from the end.
-        var i: usize = key.len;
-        while (i > 0) : (i -= 1) {
-            if (key[i - 1] == ':') return key[i..];
+        if (std.mem.startsWith(u8, key, AUTOSAVE_USER_PREFIX)) return "user";
+        if (std.mem.startsWith(u8, key, AUTOSAVE_ASSISTANT_PREFIX)) return "assistant";
+        if (std.mem.startsWith(u8, key, MESSAGE_KEY_PREFIX)) {
+            var i: usize = key.len;
+            while (i > 0) : (i -= 1) {
+                if (key[i - 1] == ':') return key[i..];
+            }
         }
         return null;
     }
@@ -906,13 +919,12 @@ pub const LatticeMemory = struct {
         const entries = try implList(@ptrCast(self), allocator, .conversation, session_id);
         defer root.freeEntries(allocator, entries);
 
-        // Sort chronologically by key — since keys are `msg:<sid>:<ns>:<role>`
-        // with a monotonically increasing nanos component, a lexicographic
-        // sort within one session_id reproduces insertion order even across
-        // process restarts.
+        // Sort chronologically by the nanosecond component decoded
+        // from each message key. Lexicographic sort would break once
+        // the store mixes both `msg:...` and `autosave_...` formats.
         std.mem.sort(root.MemoryEntry, entries, {}, struct {
             fn lt(_: void, a: root.MemoryEntry, b: root.MemoryEntry) bool {
-                return std.mem.lessThan(u8, a.key, b.key);
+                return nanosFromMessageKey(a.key) < nanosFromMessageKey(b.key);
             }
         }.lt);
 
@@ -976,9 +988,19 @@ pub const LatticeMemory = struct {
         return seen.count();
     }
 
-    /// Extract the `<nanos>` component from `msg:<session>:<nanos>:<role>`.
+    /// Extract the `<nanos>` component from either message-key scheme:
+    ///   * `msg:<session>:<nanos>:<role>` — nanos between the last
+    ///     two `:` separators.
+    ///   * `autosave_user_<nanos>` / `autosave_assistant_<nanos>` —
+    ///     digits after the role-prefix.
     /// Returns 0 on any parse failure so sort order stays deterministic.
     fn nanosFromMessageKey(key: []const u8) i128 {
+        if (std.mem.startsWith(u8, key, AUTOSAVE_USER_PREFIX)) {
+            return std.fmt.parseInt(i128, key[AUTOSAVE_USER_PREFIX.len..], 10) catch 0;
+        }
+        if (std.mem.startsWith(u8, key, AUTOSAVE_ASSISTANT_PREFIX)) {
+            return std.fmt.parseInt(i128, key[AUTOSAVE_ASSISTANT_PREFIX.len..], 10) catch 0;
+        }
         if (!std.mem.startsWith(u8, key, MESSAGE_KEY_PREFIX)) return 0;
         // Find the last ':' (role separator) and the one before it
         // (nanos separator) by scanning from the right.

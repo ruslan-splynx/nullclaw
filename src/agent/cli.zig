@@ -223,6 +223,66 @@ fn profileMemoryNamespace(allocator: std.mem.Allocator, profile_name: []const u8
     return std.fmt.allocPrint(allocator, "agent:{s}", .{normalized_name});
 }
 
+/// Recognise the two chat-message key schemes nullclaw writes:
+///   * `autosave_user_<nanos>` / `autosave_assistant_<nanos>` — the
+///     direct `mem.store` path used by `Agent.turn`.
+///   * `msg:<session>:<nanos>:<role>` — the SessionStore vtable path
+///     (currently only latticedb writes through it from CLI flow).
+/// Returns the decoded role on match, or `null` if the key is not a
+/// chat turn (bootstrap template, runtime marker, autosave scratch,
+/// etc.), so the CLI conversation-restore hook can skip it.
+fn classifyChatMessageKey(key: []const u8) ?providers.Role {
+    if (std.mem.startsWith(u8, key, "autosave_user_")) return .user;
+    if (std.mem.startsWith(u8, key, "autosave_assistant_")) return .assistant;
+    if (std.mem.startsWith(u8, key, "msg:")) {
+        // `msg:<sid>:<ns>:<role>` — the role sits after the last `:`.
+        var i: usize = key.len;
+        while (i > 0) : (i -= 1) {
+            if (key[i - 1] == ':') {
+                const role_slice = key[i..];
+                if (std.mem.eql(u8, role_slice, "assistant")) return .assistant;
+                if (std.mem.eql(u8, role_slice, "system")) return .system;
+                return .user;
+            }
+        }
+    }
+    return null;
+}
+
+/// Extract the `<nanos>` timestamp component from either chat-message
+/// key scheme, used to sort reconstructed turns chronologically on
+/// CLI resume. Returns 0 on any parse failure so sort order stays
+/// deterministic even with malformed keys.
+fn nanosFromChatMessageKey(key: []const u8) i128 {
+    const user_prefix = "autosave_user_";
+    const assistant_prefix = "autosave_assistant_";
+    if (std.mem.startsWith(u8, key, user_prefix)) {
+        return std.fmt.parseInt(i128, key[user_prefix.len..], 10) catch 0;
+    }
+    if (std.mem.startsWith(u8, key, assistant_prefix)) {
+        return std.fmt.parseInt(i128, key[assistant_prefix.len..], 10) catch 0;
+    }
+    if (!std.mem.startsWith(u8, key, "msg:")) return 0;
+    // Find the last two `:` to locate the `<nanos>` segment.
+    var last_colon: ?usize = null;
+    var prev_colon: ?usize = null;
+    var i: usize = key.len;
+    while (i > 0) : (i -= 1) {
+        if (key[i - 1] == ':') {
+            if (last_colon == null) {
+                last_colon = i - 1;
+            } else {
+                prev_colon = i - 1;
+                break;
+            }
+        }
+    }
+    const lc = last_colon orelse return 0;
+    const pc = prev_colon orelse return 0;
+    if (pc + 1 >= lc) return 0;
+    return std.fmt.parseInt(i128, key[pc + 1 .. lc], 10) catch 0;
+}
+
 fn resolveProfileProvider(
     allocator: std.mem.Allocator,
     cfg: *const Config,
@@ -607,6 +667,65 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         agent.memory_session_id = memory_session_id;
     }
     defer agent.deinit();
+
+    // Replay prior turns into the agent's conversation history so the
+    // model actually sees what the user said last time. This mirrors
+    // `SessionManager.restorePersistedSessionState` in src/session.zig
+    // but runs for the plain interactive CLI too, bypassing the
+    // SessionStore vtable so it also works when `memory_session_id`
+    // is null (plain `nullclaw agent` with no profile and no
+    // `--session`, which is how the binary is invoked 99% of the
+    // time). Reads the `.conversation` category directly via
+    // `mem.list`, sorts entries by the nanosecond suffix encoded in
+    // the autosave / `msg:` keys, and decodes the role from the key
+    // prefix — matching what latticedb's SessionStore would return
+    // internally, without requiring a non-null session id.
+    if (mem_opt) |mem_for_restore| {
+        const restored_entries: []memory_mod.MemoryEntry = mem_for_restore.list(allocator, .conversation, agent.memory_session_id) catch &[_]memory_mod.MemoryEntry{};
+        defer if (restored_entries.len > 0) memory_mod.freeEntries(allocator, restored_entries);
+
+        const ChatPiece = struct {
+            role: providers.Role,
+            content: []const u8, // borrowed, duped below
+            nanos: i128,
+        };
+        var pieces: std.ArrayListUnmanaged(ChatPiece) = .empty;
+        defer pieces.deinit(allocator);
+
+        for (restored_entries) |entry| {
+            const role_opt = classifyChatMessageKey(entry.key);
+            const role = role_opt orelse continue;
+            const nanos = nanosFromChatMessageKey(entry.key);
+            pieces.append(allocator, .{
+                .role = role,
+                .content = entry.content,
+                .nanos = nanos,
+            }) catch continue;
+        }
+
+        std.mem.sort(ChatPiece, pieces.items, {}, struct {
+            fn lt(_: void, a: ChatPiece, b: ChatPiece) bool {
+                return a.nanos < b.nanos;
+            }
+        }.lt);
+
+        var loaded: usize = 0;
+        for (pieces.items) |piece| {
+            const owned_content = allocator.dupe(u8, piece.content) catch continue;
+            agent.history.append(allocator, .{
+                .role = piece.role,
+                .content = owned_content,
+            }) catch {
+                allocator.free(owned_content);
+                continue;
+            };
+            loaded += 1;
+        }
+        if (loaded > 0) {
+            try w.print("[Conversation restored: {d} prior turns]\n", .{loaded});
+            try w.flush();
+        }
+    }
 
     // Enable streaming if provider supports it
     var stream_ctx = CliStreamCtx{
