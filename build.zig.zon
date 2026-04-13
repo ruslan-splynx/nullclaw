@@ -15,6 +15,10 @@
             .url = "git+https://github.com/nullclaw/wasm3#8a29b0080f1f65dbbe8b8f8c4d8148480feff377",
             .hash = "wasm3-0.5.1-hrMdNS09BQAWSU0TI6mVS8KfW4hxexjFvyOQINgphwKu",
         },
+        .latticedb = .{
+            .url = "git+https://github.com/ruslan-splynx/latticedb#81511b8fd0d0d54ddbf40520824282eea8d47ee9",
+            .hash = "lattice-0.1.0-HogrVtieGgAiaHkTVDtEYp0oMx4r1wgVusUHcnmeEjui",
+        },
     },
     .paths = .{
         "build.zig",

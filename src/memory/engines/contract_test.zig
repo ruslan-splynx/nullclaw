@@ -14,6 +14,7 @@ const SqliteMemory = if (build_options.enable_sqlite) @import("sqlite.zig").Sqli
 const NoneMemory = @import("none.zig").NoneMemory;
 const MarkdownMemory = @import("markdown.zig").MarkdownMemory;
 const InMemoryLruMemory = @import("memory_lru.zig").InMemoryLruMemory;
+const LatticeMemory = if (build_options.enable_memory_latticedb) @import("latticedb.zig").LatticeMemory else struct {};
 
 // ── Contract: common invariants ─────────────────────────────────────
 
@@ -304,6 +305,57 @@ test "contract: memory_lru crud" {
 
 test "contract: memory_lru session_id" {
     var mem = InMemoryLruMemory.init(std.testing.allocator, 100);
+    defer mem.deinit();
+    try contractSessionId(mem.memory());
+}
+
+// ── LatticeMemory tests ──────────────────────────────────────────────
+
+fn openLatticeTmp(tmp_dir: *std.testing.TmpDir) !struct {
+    path: [:0]u8,
+    base: []u8,
+} {
+    const base = try tmp_dir.dir.realpathAlloc(std.testing.allocator, ".");
+    errdefer std.testing.allocator.free(base);
+    const path = try std.fs.path.joinZ(std.testing.allocator, &.{ base, "lattice.db" });
+    return .{ .path = path, .base = base };
+}
+
+test "contract: latticedb basics" {
+    if (!build_options.enable_memory_latticedb) return;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const paths = try openLatticeTmp(&tmp);
+    defer std.testing.allocator.free(paths.path);
+    defer std.testing.allocator.free(paths.base);
+
+    var mem = try LatticeMemory.init(std.testing.allocator, paths.path);
+    defer mem.deinit();
+    try contractBasics(mem.memory());
+}
+
+test "contract: latticedb crud" {
+    if (!build_options.enable_memory_latticedb) return;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const paths = try openLatticeTmp(&tmp);
+    defer std.testing.allocator.free(paths.path);
+    defer std.testing.allocator.free(paths.base);
+
+    var mem = try LatticeMemory.init(std.testing.allocator, paths.path);
+    defer mem.deinit();
+    try contractCrud(mem.memory());
+}
+
+test "contract: latticedb session_id" {
+    if (!build_options.enable_memory_latticedb) return;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const paths = try openLatticeTmp(&tmp);
+    defer std.testing.allocator.free(paths.path);
+    defer std.testing.allocator.free(paths.base);
+
+    var mem = try LatticeMemory.init(std.testing.allocator, paths.path);
     defer mem.deinit();
     try contractSessionId(mem.memory());
 }

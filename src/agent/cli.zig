@@ -586,7 +586,10 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     }
 
     if (repl_history.items.len > 0) {
-        try w.print("[History: {d} entries loaded]\n", .{repl_history.items.len});
+        // NOTE: this is readline/REPL line history only (for up-arrow
+        // recall of prior CLI inputs), not conversation context. The
+        // language model still starts every run with a fresh prompt.
+        try w.print("[Input history: {d} prior lines loaded for up-arrow recall]\n", .{repl_history.items.len});
         try w.flush();
     }
 

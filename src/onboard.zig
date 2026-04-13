@@ -1258,6 +1258,7 @@ pub const wizard_memory_backend_order = [_][]const u8{
     "lucid",
     "redis",
     "lancedb",
+    "latticedb",
     "postgres",
     "api",
 };

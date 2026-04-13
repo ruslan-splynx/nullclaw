@@ -847,9 +847,11 @@ Common issues:
 
 ### `memory`
 
-- `backend`: start with `sqlite`. Available engines: `sqlite`, `markdown`, `clickhouse`, `postgres`, `redis`, `lancedb`, `lucid`, `memory` (LRU), `api`, `none`.
+- `backend`: start with `sqlite`. Available engines: `sqlite`, `markdown`, `clickhouse`, `postgres`, `redis`, `lancedb`, `lucid`, `memory` (LRU), `api`, `none`, plus `latticedb` *(experimental)*.
 - `auto_save`: persists conversation memory automatically.
 - For hybrid retrieval and embedding settings, see root `config.example.json`.
+
+**`latticedb` (experimental).** Embedded property-graph database with built-in BM25 FTS and HNSW vector support. Intended as a foundation for future graph-aware retrieval (entity linking, cross-session message walks, hybrid BM25+vector in a single store), **not** a drop-in replacement for `sqlite`. On the current nullclaw workload — K/V store, BM25 recall, category/session filters — the `zig build bench` harness consistently measures `latticedb` as 2–37× slower than `sqlite` on reads/writes and up to 4300× slower on short-lived CLI probes (the upstream lattice `lattice_open` path rebuilds its own label/posting indexes on every open). Selecting this backend also emits a `warn: latticedb backend is experimental…` log line on runtime init so operators cannot miss the trade-off. Prefer `backend = "sqlite"` unless you are specifically experimenting with the graph/vector stack.
 
 **Note**: The `markdown_only` memory profile automatically enables hybrid retrieval with temporal decay (half-life 30 days) for optimal relevance scoring. This ensures temporal awareness even with plain markdown files.
 
