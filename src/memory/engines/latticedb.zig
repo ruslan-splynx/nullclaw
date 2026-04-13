@@ -842,6 +842,443 @@ pub const LatticeMemory = struct {
         .healthCheck = &implHealthCheck,
         .deinit = &implDeinit,
     };
+
+    // ── SessionStore (conversation history on top of Entry nodes) ───
+    //
+    // Messages live as regular Entry nodes in the `.conversation` category
+    // with the session_id attached through `IN_SESSION`, so every existing
+    // operation (cache rebuild, chunking for long content, edge cascade
+    // delete) applies to them for free. The role is encoded into the Entry
+    // key as `msg:<session_id>:<nanos>:<role>` — that keeps the schema
+    // unchanged, gives chronological ordering via lexicographic sort
+    // within a session, and lets `loadMessages` recover the role without
+    // a per-node extra read. `nanos` is `std.time.nanoTimestamp()` so
+    // two messages saved inside the same millisecond still sort stably.
+    //
+    // Key-encoding caveats: a role string must not contain ':' (all
+    // canonical roles — user, assistant, system, tool, plus the runtime
+    // command sentinel — are colon-free); session_id may contain ':' but
+    // we detect the role by scanning from the *end* of the key, so that
+    // is fine.
+
+    const MESSAGE_KEY_PREFIX: []const u8 = "msg:";
+    const AUTOSAVE_KEY_PREFIX: []const u8 = "autosave_";
+
+    fn messageKeyAlloc(
+        allocator: Allocator,
+        session_id: []const u8,
+        nanos: i128,
+        role: []const u8,
+    ) ![]u8 {
+        return std.fmt.allocPrint(allocator, "msg:{s}:{d}:{s}", .{ session_id, nanos, role });
+    }
+
+    fn roleFromMessageKey(key: []const u8) ?[]const u8 {
+        if (!std.mem.startsWith(u8, key, MESSAGE_KEY_PREFIX)) return null;
+        // Last `:` separates <nanos> from <role>. Find it from the end.
+        var i: usize = key.len;
+        while (i > 0) : (i -= 1) {
+            if (key[i - 1] == ':') return key[i..];
+        }
+        return null;
+    }
+
+    pub fn saveMessage(
+        self: *Self,
+        session_id: []const u8,
+        role: []const u8,
+        content: []const u8,
+    ) !void {
+        const nanos = std.time.nanoTimestamp();
+        const key = try messageKeyAlloc(self.allocator, session_id, nanos, role);
+        defer self.allocator.free(key);
+        // Reuse the full Memory.store pipeline so content chunking,
+        // category/session node reuse, FTS indexing, and WAL logging
+        // all behave the same as for regular memory entries.
+        try implStore(@ptrCast(self), key, content, .conversation, session_id);
+    }
+
+    pub fn loadMessages(
+        self: *Self,
+        allocator: Allocator,
+        session_id: []const u8,
+    ) ![]root.MessageEntry {
+        const entries = try implList(@ptrCast(self), allocator, .conversation, session_id);
+        defer root.freeEntries(allocator, entries);
+
+        // Sort chronologically by key — since keys are `msg:<sid>:<ns>:<role>`
+        // with a monotonically increasing nanos component, a lexicographic
+        // sort within one session_id reproduces insertion order even across
+        // process restarts.
+        std.mem.sort(root.MemoryEntry, entries, {}, struct {
+            fn lt(_: void, a: root.MemoryEntry, b: root.MemoryEntry) bool {
+                return std.mem.lessThan(u8, a.key, b.key);
+            }
+        }.lt);
+
+        var out: std.ArrayListUnmanaged(root.MessageEntry) = .empty;
+        errdefer {
+            for (out.items) |m| {
+                allocator.free(m.role);
+                allocator.free(m.content);
+            }
+            out.deinit(allocator);
+        }
+
+        for (entries) |entry| {
+            const role_slice = roleFromMessageKey(entry.key) orelse continue;
+            const role_copy = try allocator.dupe(u8, role_slice);
+            errdefer allocator.free(role_copy);
+            const content_copy = try allocator.dupe(u8, entry.content);
+            try out.append(allocator, .{ .role = role_copy, .content = content_copy });
+        }
+
+        return try out.toOwnedSlice(allocator);
+    }
+
+    pub fn clearMessages(
+        self: *Self,
+        session_id: []const u8,
+    ) !void {
+        const entries = try implList(@ptrCast(self), self.allocator, .conversation, session_id);
+        defer root.freeEntries(self.allocator, entries);
+        for (entries) |entry| {
+            _ = implForget(@ptrCast(self), entry.key) catch {};
+        }
+    }
+
+    pub fn clearAutoSaved(
+        self: *Self,
+        session_id: ?[]const u8,
+    ) !void {
+        const entries = try implList(@ptrCast(self), self.allocator, null, session_id);
+        defer root.freeEntries(self.allocator, entries);
+        for (entries) |entry| {
+            if (!std.mem.startsWith(u8, entry.key, AUTOSAVE_KEY_PREFIX)) continue;
+            _ = implForget(@ptrCast(self), entry.key) catch {};
+        }
+    }
+
+    pub fn countSessions(self: *Self) !u64 {
+        const entries = try implList(@ptrCast(self), self.allocator, .conversation, null);
+        defer root.freeEntries(self.allocator, entries);
+
+        var seen: std.StringHashMapUnmanaged(void) = .empty;
+        defer seen.deinit(self.allocator);
+
+        for (entries) |entry| {
+            const sid = entry.session_id orelse continue;
+            // Skip runtime-command-only "sessions" the way sqlite does.
+            const role = roleFromMessageKey(entry.key) orelse continue;
+            if (root.isRuntimeCommandRole(role)) continue;
+            _ = try seen.getOrPut(self.allocator, sid);
+        }
+        return seen.count();
+    }
+
+    /// Extract the `<nanos>` component from `msg:<session>:<nanos>:<role>`.
+    /// Returns 0 on any parse failure so sort order stays deterministic.
+    fn nanosFromMessageKey(key: []const u8) i128 {
+        if (!std.mem.startsWith(u8, key, MESSAGE_KEY_PREFIX)) return 0;
+        // Find the last ':' (role separator) and the one before it
+        // (nanos separator) by scanning from the right.
+        var last_colon: ?usize = null;
+        var prev_colon: ?usize = null;
+        var i: usize = key.len;
+        while (i > 0) : (i -= 1) {
+            if (key[i - 1] == ':') {
+                if (last_colon == null) {
+                    last_colon = i - 1;
+                } else {
+                    prev_colon = i - 1;
+                    break;
+                }
+            }
+        }
+        const lc = last_colon orelse return 0;
+        const pc = prev_colon orelse return 0;
+        if (pc + 1 >= lc) return 0;
+        return std.fmt.parseInt(i128, key[pc + 1 .. lc], 10) catch 0;
+    }
+
+    pub fn listSessions(
+        self: *Self,
+        allocator: Allocator,
+        limit: usize,
+        offset: usize,
+    ) ![]root.SessionInfo {
+        const entries = try implList(@ptrCast(self), self.allocator, .conversation, null);
+        defer root.freeEntries(self.allocator, entries);
+
+        // Aggregate per-session: message count plus the first and last
+        // nanosecond timestamps pulled directly from the message key.
+        // Key-derived nanos beat the Entry's millisecond-resolution
+        // `created_at` property because a burst of messages written in
+        // the same millisecond would otherwise collapse into ambiguous
+        // sort order — reproducible in CI, flaky locally.
+        const SessionAgg = struct {
+            count: u64,
+            first_ns: i128,
+            last_ns: i128,
+        };
+        var agg: std.StringHashMapUnmanaged(SessionAgg) = .empty;
+        defer {
+            var it = agg.iterator();
+            while (it.next()) |e| self.allocator.free(e.key_ptr.*);
+            agg.deinit(self.allocator);
+        }
+
+        for (entries) |entry| {
+            const sid = entry.session_id orelse continue;
+            const role = roleFromMessageKey(entry.key) orelse continue;
+            if (root.isRuntimeCommandRole(role)) continue;
+            const ns = nanosFromMessageKey(entry.key);
+
+            const gop = try agg.getOrPut(self.allocator, sid);
+            if (!gop.found_existing) {
+                gop.key_ptr.* = try self.allocator.dupe(u8, sid);
+                gop.value_ptr.* = .{ .count = 1, .first_ns = ns, .last_ns = ns };
+            } else {
+                gop.value_ptr.count += 1;
+                if (ns < gop.value_ptr.first_ns) gop.value_ptr.first_ns = ns;
+                if (ns > gop.value_ptr.last_ns) gop.value_ptr.last_ns = ns;
+            }
+        }
+
+        // Materialize into a sortable array (most-recent first) before
+        // applying limit/offset — matches the `ORDER BY MAX(created_at)
+        // DESC` clause in the sqlite engine.
+        const Item = struct {
+            sid: []const u8,
+            count: u64,
+            first_ns: i128,
+            last_ns: i128,
+        };
+        var items: std.ArrayListUnmanaged(Item) = .empty;
+        defer items.deinit(self.allocator);
+        var iter = agg.iterator();
+        while (iter.next()) |e| {
+            try items.append(self.allocator, .{
+                .sid = e.key_ptr.*,
+                .count = e.value_ptr.count,
+                .first_ns = e.value_ptr.first_ns,
+                .last_ns = e.value_ptr.last_ns,
+            });
+        }
+        std.mem.sort(Item, items.items, {}, struct {
+            fn lt(_: void, a: Item, b: Item) bool {
+                return a.last_ns > b.last_ns;
+            }
+        }.lt);
+
+        var out: std.ArrayListUnmanaged(root.SessionInfo) = .empty;
+        errdefer {
+            for (out.items) |info| info.deinit(allocator);
+            out.deinit(allocator);
+        }
+
+        const total = items.items.len;
+        if (offset >= total) return try out.toOwnedSlice(allocator);
+        const end = @min(offset + limit, total);
+
+        for (items.items[offset..end]) |item| {
+            const first_buf = try std.fmt.allocPrint(allocator, "{d}", .{item.first_ns});
+            errdefer allocator.free(first_buf);
+            const last_buf = try std.fmt.allocPrint(allocator, "{d}", .{item.last_ns});
+            errdefer allocator.free(last_buf);
+            const sid_copy = try allocator.dupe(u8, item.sid);
+            try out.append(allocator, .{
+                .session_id = sid_copy,
+                .message_count = item.count,
+                .first_message_at = first_buf,
+                .last_message_at = last_buf,
+            });
+        }
+        return try out.toOwnedSlice(allocator);
+    }
+
+    pub fn countDetailedMessages(
+        self: *Self,
+        session_id: []const u8,
+    ) !u64 {
+        const entries = try implList(@ptrCast(self), self.allocator, .conversation, session_id);
+        defer root.freeEntries(self.allocator, entries);
+
+        var n: u64 = 0;
+        for (entries) |entry| {
+            const role = roleFromMessageKey(entry.key) orelse continue;
+            if (root.isRuntimeCommandRole(role)) continue;
+            n += 1;
+        }
+        return n;
+    }
+
+    /// BM25 + graph recall over conversation messages.
+    ///
+    /// Every message saved via `saveMessage` lands on disk as an
+    /// `Entry` node in the `.conversation` category and is indexed by
+    /// lattice's BM25 FTS at the same time (inherited from `implStore`
+    /// → `lattice_fts_index`). That means the moment a message is
+    /// persisted, it becomes retrievable by semantic keyword match
+    /// through this helper — **without** a separate prompt-time scan,
+    /// without a sidecar vector store, and without any extra writes.
+    ///
+    /// Callers pass a free-text `query` (the user's current turn, a
+    /// topic keyword, or a compacted summary); latticedb returns up to
+    /// `limit` ranked matches, optionally filtered to a single
+    /// `session_id`. Pass `session_id == null` to pull related turns
+    /// across *every* past conversation — the graph + FTS combination
+    /// is what makes this cheap compared to scanning a flat table.
+    ///
+    /// This is the entry point an `Agent` uses to inject relevant
+    /// prior turns into the prompt on top of chronological
+    /// `loadMessages` results. The SessionStore vtable intentionally
+    /// does not surface it — this kind of ranked retrieval is
+    /// backend-specific and not required by every engine — so
+    /// adapters that want it downcast to `LatticeMemory` first.
+    pub fn recallMessages(
+        self: *Self,
+        allocator: Allocator,
+        query: []const u8,
+        limit: usize,
+        session_id: ?[]const u8,
+    ) ![]root.MessageEntry {
+        const entries = try implRecall(@ptrCast(self), allocator, query, limit, session_id);
+        defer root.freeEntries(allocator, entries);
+
+        var out: std.ArrayListUnmanaged(root.MessageEntry) = .empty;
+        errdefer {
+            for (out.items) |m| {
+                allocator.free(m.role);
+                allocator.free(m.content);
+            }
+            out.deinit(allocator);
+        }
+
+        for (entries) |entry| {
+            // Skip hits that aren't chat messages (e.g. bootstrap templates
+            // that happen to share the current FTS vocabulary).
+            const role_slice = roleFromMessageKey(entry.key) orelse continue;
+            const role_copy = try allocator.dupe(u8, role_slice);
+            errdefer allocator.free(role_copy);
+            const content_copy = try allocator.dupe(u8, entry.content);
+            try out.append(allocator, .{ .role = role_copy, .content = content_copy });
+        }
+
+        return try out.toOwnedSlice(allocator);
+    }
+
+    pub fn loadMessagesDetailed(
+        self: *Self,
+        allocator: Allocator,
+        session_id: []const u8,
+        limit: usize,
+        offset: usize,
+    ) ![]root.DetailedMessageEntry {
+        const entries = try implList(@ptrCast(self), self.allocator, .conversation, session_id);
+        defer root.freeEntries(self.allocator, entries);
+
+        std.mem.sort(root.MemoryEntry, entries, {}, struct {
+            fn lt(_: void, a: root.MemoryEntry, b: root.MemoryEntry) bool {
+                return std.mem.lessThan(u8, a.key, b.key);
+            }
+        }.lt);
+
+        var out: std.ArrayListUnmanaged(root.DetailedMessageEntry) = .empty;
+        errdefer {
+            for (out.items) |m| {
+                allocator.free(m.role);
+                allocator.free(m.content);
+                allocator.free(m.created_at);
+            }
+            out.deinit(allocator);
+        }
+
+        var index: usize = 0;
+        var emitted: usize = 0;
+        for (entries) |entry| {
+            const role_slice = roleFromMessageKey(entry.key) orelse continue;
+            if (root.isRuntimeCommandRole(role_slice)) continue;
+            if (index < offset) {
+                index += 1;
+                continue;
+            }
+            if (emitted >= limit) break;
+            index += 1;
+            emitted += 1;
+            const role_copy = try allocator.dupe(u8, role_slice);
+            errdefer allocator.free(role_copy);
+            const content_copy = try allocator.dupe(u8, entry.content);
+            errdefer allocator.free(content_copy);
+            const ts_copy = try allocator.dupe(u8, entry.timestamp);
+            try out.append(allocator, .{
+                .role = role_copy,
+                .content = content_copy,
+                .created_at = ts_copy,
+            });
+        }
+        return try out.toOwnedSlice(allocator);
+    }
+
+    // ── SessionStore vtable glue ────────────────────────────────────
+
+    fn implSessionSaveMessage(ptr: *anyopaque, session_id: []const u8, role: []const u8, content: []const u8) anyerror!void {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        return self.saveMessage(session_id, role, content);
+    }
+
+    fn implSessionLoadMessages(ptr: *anyopaque, allocator: Allocator, session_id: []const u8) anyerror![]root.MessageEntry {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        return self.loadMessages(allocator, session_id);
+    }
+
+    fn implSessionClearMessages(ptr: *anyopaque, session_id: []const u8) anyerror!void {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        return self.clearMessages(session_id);
+    }
+
+    fn implSessionClearAutoSaved(ptr: *anyopaque, session_id: ?[]const u8) anyerror!void {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        return self.clearAutoSaved(session_id);
+    }
+
+    fn implSessionCountSessions(ptr: *anyopaque) anyerror!u64 {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        return self.countSessions();
+    }
+
+    fn implSessionListSessions(ptr: *anyopaque, allocator: Allocator, limit: usize, offset: usize) anyerror![]root.SessionInfo {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        return self.listSessions(allocator, limit, offset);
+    }
+
+    fn implSessionCountDetailedMessages(ptr: *anyopaque, session_id: []const u8) anyerror!u64 {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        return self.countDetailedMessages(session_id);
+    }
+
+    fn implSessionLoadMessagesDetailed(ptr: *anyopaque, allocator: Allocator, session_id: []const u8, limit: usize, offset: usize) anyerror![]root.DetailedMessageEntry {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        return self.loadMessagesDetailed(allocator, session_id, limit, offset);
+    }
+
+    const session_vtable = root.SessionStore.VTable{
+        .saveMessage = &implSessionSaveMessage,
+        .loadMessages = &implSessionLoadMessages,
+        .clearMessages = &implSessionClearMessages,
+        .clearAutoSaved = &implSessionClearAutoSaved,
+        .countSessions = &implSessionCountSessions,
+        .listSessions = &implSessionListSessions,
+        .countDetailedMessages = &implSessionCountDetailedMessages,
+        .loadMessagesDetailed = &implSessionLoadMessagesDetailed,
+        // `saveUsage` / `loadUsage` are opt-in on the vtable — leave
+        // them unset and the generic wrapper will surface NotSupported,
+        // matching engines like clickhouse that don't track usage.
+    };
+
+    pub fn sessionStore(self: *Self) root.SessionStore {
+        return .{ .ptr = @ptrCast(self), .vtable = &session_vtable };
+    }
 };
 
 // ── Tests ──────────────────────────────────────────────────────────
@@ -892,6 +1329,177 @@ test "latticedb memory smoke" {
     const forgotten = try m.forget("k1");
     try std.testing.expect(forgotten);
     try std.testing.expectEqual(@as(usize, 0), try m.count());
+}
+
+test "latticedb session store round-trips messages across reopens" {
+    // Regression: before this, latticedb had `supports_session_store=false`
+    // so `Agent.session_store` was null for latticedb installs and every
+    // `nullclaw agent` run started with a blank conversation context —
+    // even though bootstrap entries were present on disk. The new
+    // `sessionStore()` surfaces saveMessage/loadMessages/clearMessages
+    // on top of Entry nodes keyed by `msg:<session>:<nanos>:<role>`.
+    // This test proves:
+    //   1. messages survive process-level reopen (via the same label
+    //      scan that rebuilds `key_to_node`);
+    //   2. loadMessages returns them in insertion order;
+    //   3. multi-KiB assistant turns go through the chunk-node path so
+    //      large bodies reassemble byte-for-byte;
+    //   4. countSessions / listSessions / countDetailedMessages /
+    //      loadMessagesDetailed / clearMessages all behave consistently;
+    //   5. clearAutoSaved only targets keys with the `autosave_` prefix.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const paths = try openTmp(&tmp);
+    defer std.testing.allocator.free(paths.path);
+    defer std.testing.allocator.free(paths.base);
+
+    // Build a ~6 KiB assistant reply so we know the chunk pipeline
+    // is actually exercised by saveMessage.
+    const big_reply = try std.testing.allocator.alloc(u8, 6000);
+    defer std.testing.allocator.free(big_reply);
+    for (big_reply, 0..) |*b, i| b.* = 'a' + @as(u8, @intCast(i % 26));
+
+    {
+        var mem = try LatticeMemory.init(std.testing.allocator, paths.path);
+        defer mem.deinit();
+        const store = mem.sessionStore();
+
+        try store.saveMessage("s1", "user", "hi");
+        try store.saveMessage("s1", "assistant", big_reply);
+        try store.saveMessage("s1", "user", "follow-up");
+        try store.saveMessage("s2", "user", "hello from a second session");
+
+        // An autosave-style Memory entry that clearAutoSaved should later
+        // remove but `clearMessages("s1")` must leave alone.
+        try mem.memory().store("autosave_user_s1_123", "scratch", .core, "s1");
+    }
+
+    // Reopen: rebuilt caches should expose the same messages.
+    var mem = try LatticeMemory.init(std.testing.allocator, paths.path);
+    defer mem.deinit();
+    const store = mem.sessionStore();
+
+    {
+        const msgs = try store.loadMessages(std.testing.allocator, "s1");
+        defer root.freeMessages(std.testing.allocator, msgs);
+        try std.testing.expectEqual(@as(usize, 3), msgs.len);
+        try std.testing.expectEqualStrings("user", msgs[0].role);
+        try std.testing.expectEqualStrings("hi", msgs[0].content);
+        try std.testing.expectEqualStrings("assistant", msgs[1].role);
+        try std.testing.expectEqualSlices(u8, big_reply, msgs[1].content);
+        try std.testing.expectEqualStrings("user", msgs[2].role);
+        try std.testing.expectEqualStrings("follow-up", msgs[2].content);
+    }
+
+    try std.testing.expectEqual(@as(u64, 2), try store.countSessions());
+    try std.testing.expectEqual(@as(u64, 3), try store.countDetailedMessages("s1"));
+
+    {
+        const sessions = try store.listSessions(std.testing.allocator, 10, 0);
+        defer root.freeSessionInfos(std.testing.allocator, sessions);
+        try std.testing.expectEqual(@as(usize, 2), sessions.len);
+        // Most recent session first: s2 was written after the s1 burst.
+        try std.testing.expectEqualStrings("s2", sessions[0].session_id);
+        try std.testing.expectEqual(@as(u64, 1), sessions[0].message_count);
+        try std.testing.expectEqualStrings("s1", sessions[1].session_id);
+        try std.testing.expectEqual(@as(u64, 3), sessions[1].message_count);
+    }
+
+    {
+        const detailed = try store.loadMessagesDetailed(std.testing.allocator, "s1", 10, 0);
+        defer root.freeDetailedMessages(std.testing.allocator, detailed);
+        try std.testing.expectEqual(@as(usize, 3), detailed.len);
+        try std.testing.expect(detailed[0].created_at.len > 0);
+    }
+
+    // clearAutoSaved nukes the scratch entry but leaves chat messages.
+    try store.clearAutoSaved(null);
+    {
+        const got = try mem.memory().get(std.testing.allocator, "autosave_user_s1_123");
+        try std.testing.expect(got == null);
+        try std.testing.expectEqual(@as(u64, 3), try store.countDetailedMessages("s1"));
+    }
+
+    // clearMessages drops the whole s1 conversation.
+    try store.clearMessages("s1");
+    {
+        const msgs = try store.loadMessages(std.testing.allocator, "s1");
+        defer root.freeMessages(std.testing.allocator, msgs);
+        try std.testing.expectEqual(@as(usize, 0), msgs.len);
+    }
+    try std.testing.expectEqual(@as(u64, 1), try store.countSessions());
+}
+
+test "latticedb session messages feed BM25 recall and cross-session search" {
+    // The whole point of backing chat history with latticedb instead
+    // of a flat sqlite table is that every saved message lands in the
+    // BM25 FTS index for free (via implStore → lattice_fts_index), so
+    // the agent can recall a single topic across every past session
+    // without running a separate vector/search pipeline. This test
+    // exercises that end-to-end:
+    //
+    //   1. Multi-session message writes go through saveMessage.
+    //   2. `recallMessages("zebra", session_id)` surfaces the matching
+    //      turn scoped to a single session.
+    //   3. `recallMessages("zebra", null)` walks the graph across
+    //      sessions and returns the same hit.
+    //   4. Messages in the conversation category are also visible to
+    //      the generic `memory.recall()` entry point so existing
+    //      retrieval pipelines (which use `mem.recall`) keep working.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const paths = try openTmp(&tmp);
+    defer std.testing.allocator.free(paths.path);
+    defer std.testing.allocator.free(paths.base);
+
+    var mem = try LatticeMemory.init(std.testing.allocator, paths.path);
+    defer mem.deinit();
+    const store = mem.sessionStore();
+
+    // Session A: normal chat + one message containing a rare token.
+    try store.saveMessage("sessA", "user", "tell me about my travels");
+    try store.saveMessage("sessA", "assistant", "last winter you went to see zebra herds in tanzania");
+    try store.saveMessage("sessA", "user", "great, what else");
+
+    // Session B: noise with no overlap.
+    try store.saveMessage("sessB", "user", "help me draft a quarterly SMM plan");
+    try store.saveMessage("sessB", "assistant", "start with audience segmentation");
+
+    // In-session BM25 lookup — should land on the zebra turn.
+    {
+        const hits = try mem.recallMessages(std.testing.allocator, "zebra", 5, "sessA");
+        defer root.freeMessages(std.testing.allocator, hits);
+        try std.testing.expect(hits.len >= 1);
+        var found = false;
+        for (hits) |h| {
+            if (std.mem.indexOf(u8, h.content, "zebra") != null) {
+                found = true;
+                try std.testing.expectEqualStrings("assistant", h.role);
+                break;
+            }
+        }
+        try std.testing.expect(found);
+    }
+
+    // Cross-session BM25 lookup (session_id = null) still returns the
+    // zebra turn even though it lives inside sessA. That is the graph
+    // + FTS combination — one call, no SQL table scans.
+    {
+        const hits = try mem.recallMessages(std.testing.allocator, "zebra", 5, null);
+        defer root.freeMessages(std.testing.allocator, hits);
+        try std.testing.expect(hits.len >= 1);
+        try std.testing.expect(std.mem.indexOf(u8, hits[0].content, "zebra") != null);
+    }
+
+    // The generic Memory.recall entry point sees the same messages
+    // because they're regular Entry nodes with FTS coverage — the
+    // retrieval pipeline in `mem_rt` calls into it for free.
+    {
+        const hits = try mem.memory().recall(std.testing.allocator, "SMM", 5, null);
+        defer root.freeEntries(std.testing.allocator, hits);
+        try std.testing.expect(hits.len >= 1);
+        try std.testing.expect(std.mem.indexOf(u8, hits[0].content, "SMM") != null);
+    }
 }
 
 test "latticedb memory rebuilds key/category/session caches on reopen" {

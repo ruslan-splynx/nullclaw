@@ -208,7 +208,7 @@ const latticedb_backends = if (build_options.enable_memory_latticedb) [_]Backend
     .name = "latticedb",
     .label = "LatticeDB — embedded graph DB with vectors + BM25",
     .auto_save_default = true,
-    .capabilities = .{ .supports_keyword_rank = true, .supports_session_store = false, .supports_transactions = true, .supports_outbox = false },
+    .capabilities = .{ .supports_keyword_rank = true, .supports_session_store = true, .supports_transactions = true, .supports_outbox = false },
     .needs_db_path = true,
     .needs_workspace = false,
     .create = &createLatticeDb,
@@ -390,7 +390,7 @@ fn createLatticeDb(allocator: std.mem.Allocator, cfg: BackendConfig) !BackendIns
     errdefer allocator.destroy(impl_);
     impl_.* = try latticedb_engine.LatticeMemory.init(allocator, std.mem.span(db_path));
     impl_.owns_self = true;
-    return .{ .memory = impl_.memory(), .session_store = null };
+    return .{ .memory = impl_.memory(), .session_store = impl_.sessionStore() };
 }
 
 fn createApi(allocator: std.mem.Allocator, cfg: BackendConfig) !BackendInstance {
