@@ -623,4 +623,29 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&b.addRunArtifact(lib_tests).step);
         test_step.dependOn(&b.addRunArtifact(exe_tests).step);
     }
+
+    // ---------- memory backend benchmark ----------
+    if (!is_wasi) {
+        const bench_module = b.createModule(.{
+            .root_source_file = b.path("src/bench_memory.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "nullclaw", .module = lib_mod.? },
+                .{ .name = "build_options", .module = build_options_module },
+            },
+        });
+        const bench_exe = b.addExecutable(.{
+            .name = "bench_memory",
+            .root_module = bench_module,
+        });
+        if (sqlite3) |lib| bench_exe.linkLibrary(lib);
+        if (enable_postgres) bench_exe.root_module.linkSystemLibrary("pq", .{});
+
+        const bench_run = b.addRunArtifact(bench_exe);
+        if (b.args) |args| bench_run.addArgs(args);
+
+        const bench_step = b.step("bench", "Run memory backend microbenchmark (sqlite vs latticedb)");
+        bench_step.dependOn(&bench_run.step);
+    }
 }
